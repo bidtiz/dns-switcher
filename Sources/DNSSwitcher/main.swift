@@ -111,6 +111,14 @@ if CommandLine.arguments.contains("--self-test") {
         assert(VPNDNSGuard.isGuardConfigEnabled(from: nil) == true)
         print("[VPNDNSGuard] Pure interception, patching, restore, and config parsing verified")
 
+        // Test AppUpdater semantic version comparison
+        assert(AppUpdater.isVersion("v1.7.8", newerThan: "1.7.7"))
+        assert(AppUpdater.isVersion("1.10.0", newerThan: "1.9.0"))
+        assert(AppUpdater.isVersion("2.0.0", newerThan: "1.9.9"))
+        assert(!AppUpdater.isVersion("v1.7.7", newerThan: "1.7.7"))
+        assert(!AppUpdater.isVersion("1.7.6", newerThan: "1.7.7"))
+        print("[AppUpdater] Version comparison verified")
+
         // Test fallback disable configuration
         let disabledFallback = SystemDNSManager.resolveFallbackDNSServer(option: .disabled, customIP: "")
         assert(disabledFallback == "disabled")
