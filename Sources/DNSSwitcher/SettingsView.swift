@@ -428,13 +428,16 @@ public struct SettingsView: View {
                     HStack(spacing: 8) {
                         TextField("Домен или список через запятую (напр. corp.local, company.ru)", text: $newExcludedDomain)
                             .textFieldStyle(.roundedBorder)
+                            .onSubmit {
+                                addExcludedDomainAction()
+                            }
 
                         Button("Добавить") {
                             addExcludedDomainAction()
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(SystemDNSManager.normalizeDomainRule(newExcludedDomain) == nil)
+                        .disabled(SystemDNSManager.parseDomainRules(newExcludedDomain).isEmpty)
                     }
                     .padding(.top, 4)
                 }

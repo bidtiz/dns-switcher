@@ -91,6 +91,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         let trimmed = ipOrDisabled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if trimmed == "disabled" || trimmed == "none" {
             self.isFallbackEnabled = false
+            self.cachedSystemServers = nil
         } else if SystemDNSManager.isValidNonLoopbackIPv4(trimmed) {
             self.isFallbackEnabled = true
             self.fallbackServer = trimmed
@@ -253,8 +254,9 @@ public final class LocalDoHProxy: @unchecked Sendable {
             let systemFallback = fallbackActive ? fallbackHost : nil
             if let bypassReply = resolveViaSystemDNS(query: query, fallbackHost: systemFallback, providers: providers) {
                 let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
+                let rcode = (bypassReply.count >= 4) ? (bypassReply[3] & 0x0F) : 0
                 let ips = DNSPacket.extractARecords(from: bypassReply)
-                logResolution(domain: question.domain, qtype: qtypeStr, source: .excluded, serverName: "VPN / DHCP", latencyMs: elapsedMs, ips: ips, success: true)
+                logResolution(domain: question.domain, qtype: qtypeStr, source: .excluded, serverName: "VPN / DHCP", latencyMs: elapsedMs, ips: ips, success: rcode == 0 || rcode == 3)
                 return DNSPacket.withTransactionID(txID, in: bypassReply)
             }
             logResolution(domain: question.domain, qtype: qtypeStr, source: .error, serverName: "VPN / DHCP", latencyMs: 50, ips: [], success: false)
@@ -345,7 +347,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         var firstFallbackReply: Data? = nil
 
         for server in servers {
-            guard let reply = Port53Bridge.sendUDP(query: query, host: server, port: 53, timeoutMs: 1500),
+            guard let reply = Port53Bridge.sendUDP(query: query, host: server, port: 53, timeoutMs: 900),
                   reply.count >= 12 else {
                 continue
             }

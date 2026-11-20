@@ -22,9 +22,7 @@ if CommandLine.arguments.contains("--self-test") {
         let currentSysDNS = SystemDNSManager.currentSystemDNSServers()
         print("[Current System DNS] Detected configured DNS: \(currentSysDNS.joined(separator: ", "))")
 
-        let rules = ["*.company.ru", "https://git.corp.local/repo", ".internal"].compactMap {
-            SystemDNSManager.normalizeDomainRule($0)
-        }
+        let rules = SystemDNSManager.parseDomainRules("*.company.ru, https://git.corp.local/repo; .internal")
         assert(rules == ["company.ru", "git.corp.local", "internal"], "Normalization failed: \(rules)")
         assert(LocalDoHProxy.isDomainExcluded("jira.company.ru", excludedDomains: rules))
         assert(LocalDoHProxy.isDomainExcluded("company.ru", excludedDomains: rules))

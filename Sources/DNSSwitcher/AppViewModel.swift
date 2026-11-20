@@ -460,10 +460,9 @@ public final class AppViewModel: ObservableObject {
     }
 
     public func addExcludedDomains(_ rawInput: String) {
-        let parts = rawInput.components(separatedBy: CharacterSet(charactersIn: ",;\n\t "))
+        let parsed = SystemDNSManager.parseDomainRules(rawInput)
         var addedCount = 0
-        for part in parts {
-            guard let normalized = SystemDNSManager.normalizeDomainRule(part) else { continue }
+        for normalized in parsed {
             if !excludedDomains.contains(normalized) {
                 excludedDomains.append(normalized)
                 addedCount += 1
