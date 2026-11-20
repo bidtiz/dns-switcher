@@ -31,7 +31,7 @@ public final class AppUpdater: ObservableObject {
     private init() {}
 
     public var currentVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.7.7"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.7.8"
     }
 
     public var availableUpdate: AppUpdateInfo? {
