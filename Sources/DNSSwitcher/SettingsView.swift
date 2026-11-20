@@ -320,6 +320,42 @@ public struct SettingsView: View {
                 .padding(.vertical, 2)
             }
 
+            Section("Совместимость с VPN") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle(isOn: $viewModel.keepDoHOverVPN) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Удерживать DoH поверх VPN (GlobalProtect и др.)")
+                                .fontWeight(.medium)
+                            Text("Сохраняет 127.0.0.1 основным DNS при подключении корпоративных VPN, оставляя внутренние домены в Split-DNS. Прокси-VPN с FakeIP (v2Ray, Outline, Happ и др.) не затрагиваются.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    if viewModel.keepDoHOverVPN && viewModel.isBridgeInstalled && !viewModel.isBridgeUpToDate {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                            Text("Требуется обновить DoH-мост (v3) выше для применения этой опции.")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
+                    }
+
+                    if viewModel.isDNSOverriddenByVPN {
+                        HStack(spacing: 6) {
+                            Image(systemName: "network.badge.shield.half.filled")
+                                .foregroundColor(.orange)
+                            Text("Сейчас активный VPN перехватил системный DNS и направляет запросы в обход DoH.")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+
             Section("Резервный DNS (Фоллбэк)") {
                 VStack(alignment: .leading, spacing: 8) {
                     Picker("Использовать при сбое DoH:", selection: $viewModel.fallbackOption) {
@@ -555,7 +591,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI DNS Switcher")
                             .fontWeight(.semibold)
-                        Text("Версия 1.7.6 • macOS")
+                        Text("Версия 1.7.7 • macOS")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

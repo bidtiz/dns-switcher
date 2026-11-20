@@ -5,7 +5,7 @@ import Darwin
 /// forwarding DNS queries to the user-space MenuBar app on 127.0.0.1:53535.
 /// Includes an automatic failsafe fallback to 77.88.8.8:53 / 1.1.1.1:53 if the MenuBar app is not running.
 public enum Port53Bridge {
-    public static let bridgeVersion: Int = 2
+    public static let bridgeVersion: Int = 3
     public static let listenIP = "127.0.0.1"
     public static let listenPort: UInt16 = 53
     public static let appProxyPort: UInt16 = 53535
@@ -37,7 +37,14 @@ public enum Port53Bridge {
         udpThread.qualityOfService = .utility
         udpThread.start()
 
-        runTCPLoop()
+        let tcpThread = Thread {
+            runTCPLoop()
+        }
+        tcpThread.name = "com.dnsswitcher.bridge.tcp"
+        tcpThread.qualityOfService = .utility
+        tcpThread.start()
+
+        VPNDNSGuard.shared.start()
         dispatchMain()
     }
 

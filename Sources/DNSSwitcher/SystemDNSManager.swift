@@ -1,5 +1,6 @@
 import Foundation
 import SystemConfiguration
+import notify
 
 public enum SystemDNSManager {
     public static let daemonLabel = "com.dnsswitcher.bridge"
@@ -7,7 +8,8 @@ public enum SystemDNSManager {
     public static let bridgeBinaryDir = "/Library/Application Support/DNSSwitcher"
     public static let bridgeBinaryPath = "/Library/Application Support/DNSSwitcher/DNSSwitcherBridge"
     public static let fallbackConfigPath = "/tmp/dnsswitcher-fallback-dns.txt"
-    public static let requiredBridgeVersion = 2
+    public static let vpnGuardConfigPath = "/tmp/dnsswitcher-vpn-guard.txt"
+    public static let requiredBridgeVersion = 3
     public static let bridgeVersionPath = "/Library/Application Support/DNSSwitcher/bridge.version"
 
     private static let cacheLock = NSLock()
@@ -47,7 +49,7 @@ public enum SystemDNSManager {
         return false
     }
 
-    private static func isPhysicalEthernetService(store: SCDynamicStore, serviceID: String) -> Bool {
+    static func isPhysicalEthernetService(store: SCDynamicStore, serviceID: String) -> Bool {
         if let ifaceDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(serviceID)/Interface" as CFString) as? [String: Any],
            let name = ifaceDict["DeviceName"] as? String, name.hasPrefix("en") {
             return true
@@ -93,7 +95,7 @@ public enum SystemDNSManager {
             }
         }
 
-        // 2. Check State DNS on all non-physical services (e.g. utun*, ppp*, ipsec*)
+        // 2. Check State DNS on all non-physical services (e.g. utun*, ppp*, ipsec*, gpd.pan)
         if let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/.*/DNS" as CFString) as? [String] {
             for key in keys {
                 let parts = key.split(separator: "/")
@@ -101,10 +103,12 @@ public enum SystemDNSManager {
                 let serviceID = String(parts[3])
 
                 if !isPhysicalEthernetService(store: store, serviceID: serviceID),
-                   let stateDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
-                   let addrs = stateDNS["ServerAddresses"] as? [String] {
-                    for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
-                        if !servers.contains(ip) { servers.append(ip) }
+                   let stateDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any] {
+                    let origAddrs = (stateDNS[VPNDNSGuard.origServersKey] as? [String]).flatMap { $0.isEmpty ? nil : $0 }
+                    if let addrs = origAddrs ?? (stateDNS["ServerAddresses"] as? [String]) {
+                        for ip in addrs where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                            if !servers.contains(ip) { servers.append(ip) }
+                        }
                     }
                 }
             }
@@ -113,20 +117,113 @@ public enum SystemDNSManager {
         return servers
     }
 
-    /// Detects the underlying DHCP DNS server (or router gateway) assigned to the active network interface,
-    /// unaffected by manual `127.0.0.1` DNS override.
-    public static func detectDHCPDNSServer() -> String? {
-        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil),
-           let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
-            if let primaryService = globalIPv4["PrimaryService"] as? String,
-               let stateDNS = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
-               let addrs = stateDNS["ServerAddresses"] as? [String] {
-                for ip in addrs where isValidNonLoopbackIPv4(ip) {
-                    return ip
+    /// Detects normalized SearchDomains / SupplementalMatchDomains pushed by active VPN tunnels (e.g. GlobalProtect `rus.ru`).
+    public static func detectActiveVPNSearchDomains() -> [String] {
+        var domains: [String] = []
+        guard let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) else {
+            return []
+        }
+
+        func appendDomains(from dnsDict: [String: Any]) {
+            let search = dnsDict["SearchDomains"] as? [String] ?? []
+            let supplemental = dnsDict["SupplementalMatchDomains"] as? [String] ?? []
+            for raw in search + supplemental {
+                guard let normalized = normalizeDomainRule(raw) else { continue }
+                if !domains.contains(normalized) {
+                    domains.append(normalized)
                 }
             }
-            if let router = globalIPv4["Router"] as? String, isValidNonLoopbackIPv4(router) {
-                return router
+        }
+
+        if let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/.*/DNS" as CFString) as? [String] {
+            for key in keys {
+                let parts = key.split(separator: "/")
+                guard parts.count >= 4 else { continue }
+                let serviceID = String(parts[3])
+                guard !isPhysicalEthernetService(store: store, serviceID: serviceID),
+                      let stateDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any] else {
+                    continue
+                }
+                appendDomains(from: stateDNS)
+            }
+        }
+
+        if let keys = SCDynamicStoreCopyKeyList(store, "Setup:/Network/Service/.*/DNS" as CFString) as? [String] {
+            for key in keys {
+                let parts = key.split(separator: "/")
+                guard parts.count >= 4 else { continue }
+                let serviceID = String(parts[3])
+                guard !isPhysicalEthernetService(store: store, serviceID: serviceID),
+                      let setupDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any] else {
+                    continue
+                }
+                let isOpenVPNOverride = setupDNS["OpenVPNConnectOrigServerAddresses"] != nil
+                let isActiveTunnel = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) != nil ||
+                    SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv6" as CFString) != nil
+                if isOpenVPNOverride || isActiveTunnel {
+                    appendDomains(from: setupDNS)
+                }
+            }
+        }
+
+        return domains
+    }
+
+    /// Returns true when macOS global DNS (`State:/Network/Global/DNS`) is active and does not include `127.0.0.1`
+    /// (e.g. a VPN service took over primary DNS priority).
+    public static func isGlobalDNSOverriddenByVPN() -> Bool {
+        guard let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil),
+              let globalDNS = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
+              let servers = globalDNS["ServerAddresses"] as? [String],
+              !servers.isEmpty else {
+            return false
+        }
+        return !servers.contains("127.0.0.1")
+    }
+
+    /// Persists the VPN DNS guard toggle for the privileged bridge daemon and notifies it immediately.
+    public static func setVPNDNSGuardEnabled(_ enabled: Bool) {
+        let value = enabled ? "enabled" : "disabled"
+        let current = try? String(contentsOfFile: vpnGuardConfigPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if current != value {
+            try? value.write(toFile: vpnGuardConfigPath, atomically: true, encoding: .utf8)
+        }
+        notify_post(VPNDNSGuard.configNotificationName)
+    }
+
+    /// Detects the underlying DHCP DNS server (or router gateway) assigned to the active network interface,
+    /// unaffected by manual `127.0.0.1` DNS override or VPN primary overrides.
+    public static func detectDHCPDNSServer() -> String? {
+        if let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) {
+            if let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+               let primaryIface = globalIPv4["PrimaryInterface"] as? String,
+               primaryIface.hasPrefix("en") {
+                if let primaryService = globalIPv4["PrimaryService"] as? String,
+                   let stateDNS = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(primaryService)/DNS" as CFString) as? [String: Any],
+                   let addrs = stateDNS["ServerAddresses"] as? [String] {
+                    for ip in addrs where isValidNonLoopbackIPv4(ip) {
+                        return ip
+                    }
+                }
+                if let router = globalIPv4["Router"] as? String, isValidNonLoopbackIPv4(router) {
+                    return router
+                }
+            }
+
+            if let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/.*/DNS" as CFString) as? [String] {
+                for key in keys {
+                    let parts = key.split(separator: "/")
+                    guard parts.count >= 4 else { continue }
+                    let serviceID = String(parts[3])
+                    if isPhysicalEthernetService(store: store, serviceID: serviceID),
+                       let stateDNS = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                       let addrs = stateDNS["ServerAddresses"] as? [String] {
+                        for ip in addrs where isValidNonLoopbackIPv4(ip) {
+                            return ip
+                        }
+                    }
+                }
             }
         }
 
@@ -473,14 +570,13 @@ public enum SystemDNSManager {
             return ver >= requiredBridgeVersion
         }
 
-        // 2. If the bridge was modified on Nov 5, 2026 or later, it has the modern bridge logic
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: bridgeBinaryPath),
-           let modDate = attrs[.modificationDate] as? Date,
-           modDate.timeIntervalSince1970 > 1762300000 {
-            return true
+        // 2. Query the installed bridge binary directly via `--bridge-version`
+        if let verOut = runCommand(bridgeBinaryPath, ["--bridge-version"]),
+           let ver = Int(verOut.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return ver >= requiredBridgeVersion
         }
 
-        return Port53Bridge.isBridgeRunning()
+        return false
     }
 
     /// Installs and starts the one-time LaunchDaemon that bridges 127.0.0.1:53 -> 127.0.0.1:53535.

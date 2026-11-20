@@ -16,7 +16,17 @@ if CommandLine.arguments.contains("--bridge-version") {
 // 1b. Self-test mode (`--self-test`) to verify DoH resolution & TCP:443 proxy health from CLI
 if CommandLine.arguments.contains("--self-test") {
     let sem = DispatchSemaphore(value: 0)
+    let savedFallbackFile = try? String(contentsOfFile: SystemDNSManager.fallbackConfigPath, encoding: .utf8)
+    let hadFallbackFile = FileManager.default.fileExists(atPath: SystemDNSManager.fallbackConfigPath)
     Task {
+        defer {
+            if hadFallbackFile, let savedFallbackFile = savedFallbackFile {
+                try? savedFallbackFile.write(toFile: SystemDNSManager.fallbackConfigPath, atomically: true, encoding: .utf8)
+            } else {
+                try? FileManager.default.removeItem(atPath: SystemDNSManager.fallbackConfigPath)
+            }
+            sem.signal()
+        }
         let sysServers = SystemDNSManager.detectSystemAndVPNDNSServers(fallbackIP: "77.88.8.8")
         print("[System/VPN DNS] Detected bypass servers: \(sysServers.joined(separator: ", "))")
         let currentSysDNS = SystemDNSManager.currentSystemDNSServers()
@@ -29,6 +39,77 @@ if CommandLine.arguments.contains("--self-test") {
         assert(LocalDoHProxy.isDomainExcluded("app.internal", excludedDomains: rules))
         assert(!LocalDoHProxy.isDomainExcluded("mycompany.ru", excludedDomains: rules))
         print("[Excluded Domains] Rule matching verified: \(rules.joined(separator: ", "))")
+
+        // Test VPNDNSGuard pure decision & patching helpers
+        assert(VPNDNSGuard.isFakeIPAddress("198.18.0.2"))
+        assert(VPNDNSGuard.isFakeIPAddress("198.19.0.1"))
+        assert(VPNDNSGuard.isFakeIPAddress("172.19.0.2"))
+        assert(!VPNDNSGuard.isFakeIPAddress("10.1.155.1"))
+        assert(!VPNDNSGuard.isFakeIPAddress("192.168.31.1"))
+
+        assert(VPNDNSGuard.isKnownProxyBundleID("com.databridges.privacy.v2RayTun.packet-extension-mac"))
+        assert(VPNDNSGuard.isKnownProxyBundleID("su.ffg.happ.plus.tunnel"))
+        assert(VPNDNSGuard.isKnownProxyBundleID("org.outline.macos.client.VpnExtension"))
+        assert(VPNDNSGuard.isKnownProxyBundleID("hossin.asaadi.V2Box.PacketTunnel"))
+        assert(!VPNDNSGuard.isKnownProxyBundleID("com.wireguard.macos.network-extension"))
+
+        let gpDict: [String: Any] = [
+            "ServerAddresses": ["10.1.155.1", "10.1.155.2"],
+            "SearchDomains": ["rus.ru"],
+            "SearchOrder": 50000
+        ]
+        assert(VPNDNSGuard.shouldInterceptVPNService(serviceID: "gpd.pan", isPhysicalEthernet: false, dnsDict: gpDict, vpnBundleID: nil))
+        assert(VPNDNSGuard.shouldInterceptVPNService(
+            serviceID: "utun-catchall",
+            isPhysicalEthernet: false,
+            dnsDict: ["ServerAddresses": ["10.0.0.1"], "SupplementalMatchDomains": [""]],
+            vpnBundleID: nil
+        ))
+        assert(!VPNDNSGuard.shouldInterceptVPNService(
+            serviceID: "utun-scoped",
+            isPhysicalEthernet: false,
+            dnsDict: ["ServerAddresses": ["10.0.0.1"], "SupplementalMatchDomains": ["corp.local"]],
+            vpnBundleID: nil
+        ))
+        assert(!VPNDNSGuard.shouldInterceptVPNService(
+            serviceID: "A8B523DD",
+            isPhysicalEthernet: true,
+            dnsDict: ["ServerAddresses": ["192.168.31.1"]],
+            vpnBundleID: nil
+        ))
+        assert(!VPNDNSGuard.shouldInterceptVPNService(
+            serviceID: "utun-fakeip",
+            isPhysicalEthernet: false,
+            dnsDict: ["ServerAddresses": ["198.18.0.2"]],
+            vpnBundleID: nil
+        ))
+        assert(!VPNDNSGuard.shouldInterceptVPNService(
+            serviceID: "A689EA1C",
+            isPhysicalEthernet: false,
+            dnsDict: ["ServerAddresses": ["1.1.1.1"]],
+            vpnBundleID: "org.outline.macos.client.VpnExtension"
+        ))
+
+        let patched = VPNDNSGuard.makePatchedDNSDict(from: gpDict)
+        assert(patched != nil)
+        assert((patched?["ServerAddresses"] as? [String]) == ["127.0.0.1"])
+        assert((patched?[VPNDNSGuard.origServersKey] as? [String]) == ["10.1.155.1", "10.1.155.2"])
+        assert((patched?["SearchDomains"] as? [String]) == ["rus.ru"])
+        assert((patched?["SearchOrder"] as? Int) == 50000)
+        assert(VPNDNSGuard.makePatchedDNSDict(from: patched!) == nil)
+
+        let restored = VPNDNSGuard.makeRestoredDNSDict(from: patched!)
+        assert(restored != nil)
+        assert((restored?["ServerAddresses"] as? [String]) == ["10.1.155.1", "10.1.155.2"])
+        assert(restored?[VPNDNSGuard.origServersKey] == nil)
+        assert((restored?["SearchDomains"] as? [String]) == ["rus.ru"])
+        assert((restored?["SearchOrder"] as? Int) == 50000)
+        assert(VPNDNSGuard.makeRestoredDNSDict(from: restored!) == nil)
+
+        assert(VPNDNSGuard.isGuardConfigEnabled(from: "enabled") == true)
+        assert(VPNDNSGuard.isGuardConfigEnabled(from: "disabled") == false)
+        assert(VPNDNSGuard.isGuardConfigEnabled(from: nil) == true)
+        print("[VPNDNSGuard] Pure interception, patching, restore, and config parsing verified")
 
         // Test fallback disable configuration
         let disabledFallback = SystemDNSManager.resolveFallbackDNSServer(option: .disabled, customIP: "")
@@ -94,7 +175,6 @@ if CommandLine.arguments.contains("--self-test") {
             let health = await LocalDoHProxy.shared.checkProviderHealth(provider)
             print("[\(provider.name)] DoH: \(provider.dohURL) -> \(health.badgeText)")
         }
-        sem.signal()
     }
     sem.wait()
     exit(0)

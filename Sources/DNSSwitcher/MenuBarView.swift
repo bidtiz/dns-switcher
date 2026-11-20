@@ -42,6 +42,10 @@ public struct MenuBarView: View {
                 bridgeUpdateBanner
             }
 
+            if viewModel.selectedProviderID != nil && viewModel.isDNSOverriddenByVPN && viewModel.isBridgeUpToDate {
+                vpnOverrideBanner
+            }
+
             Divider()
                 .padding(.horizontal, 2)
 
@@ -320,6 +324,37 @@ public struct MenuBarView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(Color.red.opacity(0.12))
+        .cornerRadius(6)
+    }
+
+    private var vpnOverrideBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "network.slash")
+                .foregroundColor(.orange)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("VPN использует свой DNS")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(!viewModel.keepDoHOverVPN
+                     ? "Удержание DoH поверх VPN выключено"
+                     : "Туннель перехватил системный DNS")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            if !viewModel.keepDoHOverVPN {
+                Button("Включить") {
+                    viewModel.keepDoHOverVPN = true
+                }
+                .font(.system(size: 11, weight: .medium))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.12))
         .cornerRadius(6)
     }
 

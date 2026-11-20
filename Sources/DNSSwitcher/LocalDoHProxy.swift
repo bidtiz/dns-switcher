@@ -12,6 +12,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
     private var isFallbackEnabled: Bool = true
     private var excludedDomains: [String] = []
     private var cachedSystemServers: (servers: [String], expiresAt: Date)?
+    private var cachedVPNSearchDomains: (domains: [String], expiresAt: Date)?
 
     private struct CacheEntry {
         let data: Data
@@ -55,6 +56,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         self.urlSession = URLSession(configuration: Self.makeSessionConfiguration())
         self.inFlightRequests.removeAll()
         self.cachedSystemServers = nil
+        self.cachedVPNSearchDomains = nil
         self.dynamicBootstrapCache.removeAll()
         self.cache.removeAll()
         lock.unlock()
@@ -126,6 +128,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
         lock.lock()
         cache.removeAll()
         cachedSystemServers = nil
+        cachedVPNSearchDomains = nil
         lock.unlock()
     }
 
@@ -263,6 +266,22 @@ public final class LocalDoHProxy: @unchecked Sendable {
             return DNSPacket.buildFailureResponse(for: query, rcode: 2)
         }
 
+        // 1c. Active VPN SearchDomains check: route corporate suffix queries directly through VPN DNS (Split-DNS)
+        let vpnSearchDomains = getActiveVPNSearchDomains()
+        if !vpnSearchDomains.isEmpty && Self.isDomainExcluded(question.domain, excludedDomains: vpnSearchDomains) {
+            let vpnServers = SystemDNSManager.detectActiveVPNDNSServers(ignoringBootstrapIPs: Set(providers.flatMap { $0.bootstrapIPs }))
+            if !vpnServers.isEmpty {
+                let vpnStart = DispatchTime.now()
+                if let vpnReply = resolveViaSpecificDNSAllowingNXDOMAIN(query: query, servers: vpnServers) {
+                    let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - vpnStart.uptimeNanoseconds) / 1_000_000))
+                    let rcode = (vpnReply.count >= 4) ? (vpnReply[3] & 0x0F) : 0
+                    let ips = DNSPacket.extractARecords(from: vpnReply)
+                    logResolution(domain: question.domain, qtype: qtypeStr, source: .excluded, serverName: "VPN DNS", latencyMs: elapsedMs, ips: ips, success: rcode == 0 || rcode == 3)
+                    return DNSPacket.withTransactionID(txID, in: vpnReply)
+                }
+            }
+        }
+
         // 2. Check fresh in-memory TTL cache (instant response, <1ms)
         let cacheKey = "\(provider.id):\(question.domain):\(question.qtype)"
         if let freshCached = getFreshCached(key: cacheKey) {
@@ -284,10 +303,16 @@ public final class LocalDoHProxy: @unchecked Sendable {
                     let vpnRcode = (vpnReply.count >= 4) ? (vpnReply[3] & 0x0F) : 0
                     let vpnIps = DNSPacket.extractARecords(from: vpnReply)
                     if vpnRcode == 0 && !vpnIps.isEmpty {
+                        let vpnTTL = min(DNSPacket.extractMinTTL(from: vpnReply, defaultTTL: 60), 60)
+                        self.setCached(key: cacheKey, data: vpnReply, freshTTL: vpnTTL, ips: vpnIps)
                         let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000))
                         logResolution(domain: question.domain, qtype: qtypeStr, source: .excluded, serverName: "VPN DNS", latencyMs: elapsedMs, ips: vpnIps, success: true)
                         return DNSPacket.withTransactionID(txID, in: vpnReply)
                     }
+                }
+                if SystemDNSManager.hasActiveVPNIPv4Interface() {
+                    let shortTTL = min(DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 30), 30)
+                    self.setCached(key: cacheKey, data: dohReply, freshTTL: shortTTL, ips: ips)
                 }
             }
 
@@ -373,6 +398,39 @@ public final class LocalDoHProxy: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    private func resolveViaSpecificDNSAllowingNXDOMAIN(query: Data, servers: [String]) -> Data? {
+        var firstNXDomain: Data? = nil
+        for server in servers {
+            guard let reply = Port53Bridge.sendUDP(query: query, host: server, port: 53, timeoutMs: 900),
+                  reply.count >= 12 else {
+                continue
+            }
+            let rcode = reply[3] & 0x0F
+            if rcode == 0 {
+                return reply
+            }
+            if rcode == 3 && firstNXDomain == nil {
+                firstNXDomain = reply
+            }
+        }
+        return firstNXDomain
+    }
+
+    private func getActiveVPNSearchDomains() -> [String] {
+        lock.lock()
+        if let cached = cachedVPNSearchDomains, cached.expiresAt > Date() {
+            lock.unlock()
+            return cached.domains
+        }
+        lock.unlock()
+
+        let detected = SystemDNSManager.detectActiveVPNSearchDomains()
+        lock.lock()
+        cachedVPNSearchDomains = (detected, Date().addingTimeInterval(30.0))
+        lock.unlock()
+        return detected
     }
 
     private func getSystemAndVPNDNSServers(fallbackHost: String?, providers: [DNSProvider]) -> [String] {
@@ -573,9 +631,13 @@ public final class LocalDoHProxy: @unchecked Sendable {
             guard let dohReply = await self.performDoHRequest(query: query, dohURL: dohURL) else {
                 return nil
             }
+            let rcode = (dohReply.count >= 4) ? (dohReply[3] & 0x0F) : 0
             let ips = DNSPacket.extractARecords(from: dohReply)
-            let ttl = DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 60)
-            self.setCached(key: key, data: dohReply, freshTTL: ttl, ips: ips)
+            let shouldDeferCacheForVPN = (rcode == 3 || (rcode == 0 && ips.isEmpty)) && SystemDNSManager.hasActiveVPNIPv4Interface()
+            if !shouldDeferCacheForVPN {
+                let ttl = DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 60)
+                self.setCached(key: key, data: dohReply, freshTTL: ttl, ips: ips)
+            }
             return (dohReply, ips)
         }
         inFlightRequests[key] = task

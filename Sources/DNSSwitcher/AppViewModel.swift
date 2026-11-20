@@ -26,6 +26,13 @@ public final class AppViewModel: ObservableObject {
             UserDefaults.standard.set(resetDNSOnQuit, forKey: "resetDNSOnQuit")
         }
     }
+    @Published public var keepDoHOverVPN: Bool = true {
+        didSet {
+            UserDefaults.standard.set(keepDoHOverVPN, forKey: keepDoHOverVPNKey)
+            applyVPNDNSGuardConfiguration()
+        }
+    }
+    @Published public var isDNSOverriddenByVPN: Bool = false
     @Published public var fallbackOption: FallbackDNSOption = .system {
         didSet {
             UserDefaults.standard.set(fallbackOption.rawValue, forKey: fallbackOptionKey)
@@ -86,6 +93,7 @@ public final class AppViewModel: ObservableObject {
     private let fallbackOptionKey = "fallbackDNSOption"
     private let customFallbackIPKey = "customFallbackDNSIP"
     private let excludedDomainsKey = "excludedDNSDomains"
+    private let keepDoHOverVPNKey = "keepDoHOverVPN"
 
     public init() {
         loadProviders()
@@ -96,6 +104,10 @@ public final class AppViewModel: ObservableObject {
         if UserDefaults.standard.object(forKey: "resetDNSOnQuit") != nil {
             self.resetDNSOnQuit = UserDefaults.standard.bool(forKey: "resetDNSOnQuit")
         }
+        if UserDefaults.standard.object(forKey: keepDoHOverVPNKey) != nil {
+            self.keepDoHOverVPN = UserDefaults.standard.bool(forKey: keepDoHOverVPNKey)
+        }
+        SystemDNSManager.setVPNDNSGuardEnabled(keepDoHOverVPN)
         if let rawOption = UserDefaults.standard.string(forKey: fallbackOptionKey),
            let parsedOption = FallbackDNSOption(rawValue: rawOption) {
             self.fallbackOption = parsedOption
@@ -161,6 +173,15 @@ public final class AppViewModel: ObservableObject {
         LocalDoHProxy.shared.setFallbackServer(resolved)
     }
 
+    public func applyVPNDNSGuardConfiguration() {
+        SystemDNSManager.setVPNDNSGuardEnabled(keepDoHOverVPN)
+        LocalDoHProxy.shared.resetNetworkConnections()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            self?.refreshSystemState()
+        }
+    }
+
     public func clearHistory() {
         DNSHistoryStore.shared.clear()
     }
@@ -185,7 +206,7 @@ public final class AppViewModel: ObservableObject {
                     self.refreshSystemState()
                     let isVPN = SystemDNSManager.hasActiveVPNIPv4Interface()
                     if isVPN {
-                        self.statusMessage = "DoH активен • OpenVPN подключен (Split-DNS)"
+                        self.statusMessage = "DoH активен • VPN подключен (Split-DNS)"
                     } else {
                         self.statusMessage = "DoH активен (\(active.name))"
                     }
@@ -202,6 +223,8 @@ public final class AppViewModel: ObservableObject {
         isBridgeUpToDate = isBridgeInstalled && SystemDNSManager.isBridgeBinaryUpToDate()
         hasConflictingProfile = SystemDNSManager.hasActiveMobileConfigDNSProfile()
         let currentServers = SystemDNSManager.currentSystemDNSServers()
+        let globalOverridden = SystemDNSManager.isGlobalDNSOverriddenByVPN()
+        isDNSOverriddenByVPN = currentServers.contains("127.0.0.1") && globalOverridden
 
         if currentServers.contains("127.0.0.1") {
             let savedID = UserDefaults.standard.string(forKey: lastProviderKey) ?? providers.first?.id
@@ -209,7 +232,16 @@ public final class AppViewModel: ObservableObject {
             if let provider = activeProvider {
                 LocalDoHProxy.shared.configure(active: provider, all: providers)
                 let isVPN = SystemDNSManager.hasActiveVPNIPv4Interface()
-                if isVPN {
+                if isDNSOverriddenByVPN {
+                    activeModeText = "DoH приостановлен • VPN перехватил DNS"
+                    if isBridgeInstalled && !isBridgeUpToDate {
+                        statusMessage = "Обновите DoH-мост (v3) для работы поверх VPN"
+                    } else if !keepDoHOverVPN {
+                        statusMessage = "Удержание DoH поверх VPN выключено в настройках"
+                    } else {
+                        statusMessage = "Туннель VPN перехватил системный DNS"
+                    }
+                } else if isVPN {
                     activeModeText = "Активен DoH • \(provider.name) (VPN активен)"
                     statusMessage = "DoH 127.0.0.1 + Split-DNS для VPN"
                 } else {
