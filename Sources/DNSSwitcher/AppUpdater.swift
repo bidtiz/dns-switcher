@@ -50,6 +50,12 @@ public final class AppUpdater: ObservableObject {
         }
     }
 
+    public func dismissError() {
+        if case .failed = state {
+            state = .idle
+        }
+    }
+
     /// Compares two semantic version strings (e.g. "v1.7.8" vs "1.7.7").
     public nonisolated static func isVersion(_ candidate: String, newerThan current: String) -> Bool {
         let parse: (String) -> [Int] = { raw in
@@ -136,6 +142,12 @@ public final class AppUpdater: ObservableObject {
         state = .downloading
         let workDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dnsswitcher-update-\(UUID().uuidString)", isDirectory: true)
+        var handoffToShell = false
+        defer {
+            if !handoffToShell {
+                try? FileManager.default.removeItem(at: workDir)
+            }
+        }
 
         do {
             try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
@@ -175,11 +187,16 @@ public final class AppUpdater: ObservableObject {
             let needsAdmin = !FileManager.default.isWritableFile(atPath: targetParent) ||
                              !FileManager.default.isWritableFile(atPath: bundleURL.path)
 
+            let script = makeAtomicReplaceAndRelaunchScript(
+                newAppPath: newAppURL.path,
+                targetAppPath: bundleURL.path,
+                workDirPath: workDir.path,
+                runAsUserUID: needsAdmin ? getuid() : nil
+            )
+
             if needsAdmin {
-                let escNew = shellEscape(newAppURL.path)
-                let escTarget = shellEscape(bundleURL.path)
-                let scriptCmd = "rm -rf \(escTarget) && mv \(escNew) \(escTarget) && xattr -cr \(escTarget) 2>/dev/null || true"
-                let appleScript = "do shell script \"\(scriptCmd.replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
+                let bgCmd = "/bin/sh -c \(shellEscape(script)) >/dev/null 2>&1 &"
+                let appleScript = "do shell script \(appleScriptStringLiteral(bgCmd)) with administrator privileges"
                 let adminOk = await Task.detached(priority: .userInitiated) {
                     let proc = Process()
                     proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -197,42 +214,68 @@ public final class AppUpdater: ObservableObject {
                     state = .available(info)
                     return
                 }
-                relaunchAfterExit(appPath: bundleURL.path, workDirPath: workDir.path, replaceFrom: nil)
             } else {
-                relaunchAfterExit(appPath: bundleURL.path, workDirPath: workDir.path, replaceFrom: newAppURL.path)
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+                proc.arguments = ["-c", script]
+                try proc.run()
             }
 
+            handoffToShell = true
             NSApplication.shared.terminate(nil)
         } catch {
             state = .failed("Не удалось установить обновление")
         }
     }
 
-    private func relaunchAfterExit(appPath: String, workDirPath: String, replaceFrom: String?) {
+    private func makeAtomicReplaceAndRelaunchScript(
+        newAppPath: String,
+        targetAppPath: String,
+        workDirPath: String,
+        runAsUserUID: uid_t?
+    ) -> String {
         let pid = ProcessInfo.processInfo.processIdentifier
-        let escTarget = shellEscape(appPath)
+        let escNew = shellEscape(newAppPath)
+        let escTarget = shellEscape(targetAppPath)
+        let escBackup = shellEscape("\(targetAppPath).backup-\(UUID().uuidString)")
         let escWork = shellEscape(workDirPath)
 
-        var replaceStep = ""
-        if let src = replaceFrom {
-            let escSrc = shellEscape(src)
-            replaceStep = "rm -rf \(escTarget) && mv \(escSrc) \(escTarget) && xattr -cr \(escTarget) 2>/dev/null || true; "
+        let openCmd: String
+        if let uid = runAsUserUID {
+            openCmd = "/bin/launchctl asuser \(uid) /usr/bin/open -n \(escTarget)"
+        } else {
+            openCmd = "/usr/bin/open -n \(escTarget)"
         }
 
-        let script = """
+        return """
         while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
-        \(replaceStep)open -n \(escTarget)
+        if [ -e \(escTarget) ]; then
+            mv \(escTarget) \(escBackup) || { rm -rf \(escWork); exit 1; }
+        fi
+        if mv \(escNew) \(escTarget); then
+            rm -rf \(escBackup)
+        else
+            if [ -e \(escBackup) ]; then
+                mv \(escBackup) \(escTarget)
+            fi
+            rm -rf \(escWork)
+            exit 1
+        fi
+        xattr -cr \(escTarget) 2>/dev/null || true
         rm -rf \(escWork)
+        \(openCmd)
         """
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-        proc.arguments = ["-c", script]
-        try? proc.run()
     }
 
     private func shellEscape(_ path: String) -> String {
         "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func appleScriptStringLiteral(_ s: String) -> String {
+        let escaped = s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 }
 

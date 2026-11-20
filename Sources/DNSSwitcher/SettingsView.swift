@@ -592,7 +592,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI DNS Switcher")
                             .fontWeight(.semibold)
-                        Text("Версия \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.7.7") • macOS")
+                        Text("Версия \(updater.currentVersion) • macOS")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

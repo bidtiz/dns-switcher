@@ -76,10 +76,6 @@ public struct MenuBarView: View {
 
     // MARK: - Control Center Header
 
-    private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.7.7"
-    }
-
     private var headerSection: some View {
         let isActive = (viewModel.selectedProviderID != nil)
         return HStack(spacing: 10) {
@@ -96,7 +92,7 @@ public struct MenuBarView: View {
                 HStack(spacing: 5) {
                     Text("AI DNS")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("v\(appVersion)")
+                    Text("v\(updater.currentVersion)")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary.opacity(0.8))
                 }
@@ -408,6 +404,39 @@ public struct MenuBarView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .background(Color.blue.opacity(0.12))
+            .cornerRadius(6)
+        case .failed(let message):
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.red)
+                    .font(.system(size: 13))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Ошибка обновления")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer()
+                Button("Повторить") {
+                    Task { await updater.checkForUpdates(silent: false) }
+                }
+                .font(.system(size: 11, weight: .medium))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+                Button {
+                    updater.dismissError()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.red.opacity(0.12))
             .cornerRadius(6)
         default:
             EmptyView()
