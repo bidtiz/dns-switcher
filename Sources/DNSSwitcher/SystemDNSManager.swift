@@ -564,15 +564,12 @@ public enum SystemDNSManager {
     public static func isBridgeBinaryUpToDate() -> Bool {
         guard FileManager.default.fileExists(atPath: bridgeBinaryPath) else { return false }
 
-        // 1. Check version file if present
+        // Check version file written by installPort53BridgeDaemon().
+        // Do NOT execute `bridgeBinaryPath --bridge-version` when `bridge.version` is missing:
+        // legacy bridge binaries (pre-v1.5.0) ignore `--bridge-version`, launch a second GUI instance,
+        // and block the caller indefinitely in waitUntilExit().
         if let verStr = try? String(contentsOfFile: bridgeVersionPath, encoding: .utf8),
            let ver = Int(verStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return ver >= requiredBridgeVersion
-        }
-
-        // 2. Query the installed bridge binary directly via `--bridge-version`
-        if let verOut = runCommand(bridgeBinaryPath, ["--bridge-version"]),
-           let ver = Int(verOut.trimmingCharacters(in: .whitespacesAndNewlines)) {
             return ver >= requiredBridgeVersion
         }
 

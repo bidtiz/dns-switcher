@@ -133,6 +133,7 @@ public final class AppViewModel: ObservableObject {
         refreshSystemState()
         Task {
             await checkAllProvidersHealth()
+            await AppUpdater.shared.checkForUpdates(silent: true)
         }
     }
 

@@ -22,6 +22,7 @@ public enum SettingsTab: String, CaseIterable, Identifiable {
 public struct SettingsView: View {
     @ObservedObject var viewModel: AppViewModel
     @ObservedObject private var historyStore: DNSHistoryStore = DNSHistoryStore.shared
+    @ObservedObject private var updater = AppUpdater.shared
     var onOpenHistory: (() -> Void)? = nil
 
     @State private var selectedTab: SettingsTab = .servers
@@ -591,7 +592,7 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI DNS Switcher")
                             .fontWeight(.semibold)
-                        Text("Версия 1.7.7 • macOS")
+                        Text("Версия \(updater.currentVersion) • macOS")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -608,6 +609,65 @@ public struct SettingsView: View {
                     }
                 }
                 .padding(.vertical, 2)
+
+                if let repoURL = URL(string: "https://github.com/devpassru/dns-switcher") {
+                    HStack {
+                        Label("Репозиторий проекта", systemImage: "link")
+                        Spacer()
+                        Link("github.com/devpassru/dns-switcher", destination: repoURL)
+                            .font(.caption)
+                    }
+                }
+
+                HStack {
+                    Label("Обновления", systemImage: "arrow.down.circle")
+                    Spacer()
+                    switch updater.state {
+                    case .idle:
+                        Button("Проверить") {
+                            Task { await updater.checkForUpdates(silent: false) }
+                        }
+                        .controlSize(.small)
+                    case .checking:
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("Проверка…").font(.caption).foregroundColor(.secondary)
+                        }
+                    case .upToDate:
+                        HStack(spacing: 8) {
+                            Text("Актуальная версия")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                            Button("Проверить") {
+                                Task { await updater.checkForUpdates(silent: false) }
+                            }
+                            .controlSize(.small)
+                        }
+                    case .available(let info):
+                        Button("Обновить до v\(info.version)") {
+                            Task { await updater.installAvailableUpdate() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    case .downloading, .installing:
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text(updater.state == .downloading ? "Загрузка…" : "Установка…")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    case .failed(let message):
+                        HStack(spacing: 8) {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                            Button("Повторить") {
+                                Task { await updater.checkForUpdates(silent: false) }
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
             }
         }
         .formStyle(.grouped)
