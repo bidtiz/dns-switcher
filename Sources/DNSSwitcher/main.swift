@@ -119,7 +119,7 @@ if CommandLine.arguments.contains("--self-test") {
         assert(!AppUpdater.isVersion("1.7.6", newerThan: "1.7.7"))
         print("[AppUpdater] Version comparison verified")
 
-        let samplePush = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.16.5.200,dhcp-option DNS 10.16.5.201,route 10.16.0.0 255.255.0.0'"
+        let samplePush = "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.16.5.200,dhcp-option  DNS  10.16.5.201,route 10.16.0.0 255.255.0.0'"
         assert(SystemDNSManager.parseOpenVPNPushedDNS(from: samplePush) == ["10.16.5.200", "10.16.5.201"])
         print("[Tunnelblick DNS] OpenVPN PUSH_REPLY parsing verified")
 

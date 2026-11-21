@@ -189,8 +189,10 @@ public final class AppViewModel: ObservableObject {
 
     private func preserveCurrentVPNDNSIfActive(currentServers: [String]) {
         guard SystemDNSManager.hasActiveVPNIPv4Interface() else { return }
-        let vpnCandidates = currentServers + SystemDNSManager.detectActiveVPNDNSServers()
-        SystemDNSManager.preserveVPNDNSServers(vpnCandidates)
+        let bootstrapIPs = Set(providers.flatMap { $0.bootstrapIPs })
+        let liveVPN = SystemDNSManager.detectActiveVPNDNSServers(ignoringBootstrapIPs: bootstrapIPs)
+        let filteredCurrent = currentServers.filter { !bootstrapIPs.contains($0) }
+        SystemDNSManager.preserveVPNDNSServers(liveVPN + filteredCurrent)
     }
 
     @MainActor

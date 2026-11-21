@@ -9,7 +9,7 @@ public enum SystemDNSManager {
     public static let bridgeBinaryPath = "/Library/Application Support/DNSSwitcher/DNSSwitcherBridge"
     public static let fallbackConfigPath = "/tmp/dnsswitcher-fallback-dns.txt"
     public static let vpnGuardConfigPath = "/tmp/dnsswitcher-vpn-guard.txt"
-    public static let preservedVPNDNSPath = "/tmp/dnsswitcher-vpn-dns.txt"
+    private static let preservedVPNDNSDefaultsKey = "preservedVPNDNSServers"
     public static let requiredBridgeVersion = 3
     public static let bridgeVersionPath = "/Library/Application Support/DNSSwitcher/bridge.version"
 
@@ -17,11 +17,13 @@ public enum SystemDNSManager {
     private static var cachedPhysicalServices: (services: [String], expiresAt: Date)?
     private static var cachedMobileConfigCheck: (hasProfile: Bool, expiresAt: Date)?
     private static var cachedPreservedVPNDNS: [String]?
+    private static var cachedTunnelblickDNS: (scriptLogPath: String, servers: [String], expiresAt: Date)?
 
     public static func clearCaches() {
         cacheLock.lock()
         cachedPhysicalServices = nil
         cachedMobileConfigCheck = nil
+        cachedTunnelblickDNS = nil
         cacheLock.unlock()
     }
 
@@ -36,15 +38,15 @@ public enum SystemDNSManager {
         cacheLock.lock()
         cachedPreservedVPNDNS = unique
         cacheLock.unlock()
-        try? unique.joined(separator: "\n").write(toFile: preservedVPNDNSPath, atomically: true, encoding: .utf8)
+        UserDefaults.standard.set(unique, forKey: preservedVPNDNSDefaultsKey)
     }
 
     public static func clearPreservedVPNDNSServers() {
         cacheLock.lock()
         cachedPreservedVPNDNS = []
         cacheLock.unlock()
-        if FileManager.default.fileExists(atPath: preservedVPNDNSPath) {
-            try? FileManager.default.removeItem(atPath: preservedVPNDNSPath)
+        if UserDefaults.standard.object(forKey: preservedVPNDNSDefaultsKey) != nil {
+            UserDefaults.standard.removeObject(forKey: preservedVPNDNSDefaultsKey)
         }
     }
 
@@ -56,15 +58,10 @@ public enum SystemDNSManager {
         }
         cacheLock.unlock()
 
-        let loaded: [String]
-        if let content = try? String(contentsOfFile: preservedVPNDNSPath, encoding: .utf8) {
-            loaded = content
-                .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { isValidNonLoopbackIPv4($0) }
-        } else {
-            loaded = []
-        }
+        let saved = UserDefaults.standard.stringArray(forKey: preservedVPNDNSDefaultsKey) ?? []
+        let loaded = saved
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { isValidNonLoopbackIPv4($0) }
 
         cacheLock.lock()
         cachedPreservedVPNDNS = loaded
@@ -114,16 +111,17 @@ public enum SystemDNSManager {
     /// Detects active VPN DNS servers (e.g. OpenVPN, WireGuard, IPSec) assigned to tunnels or dynamic store overrides.
     public static func detectActiveVPNDNSServers(ignoringBootstrapIPs: Set<String> = []) -> [String] {
         var servers: [String] = []
-
-        if hasActiveVPNIPv4Interface() {
-            for ip in loadPreservedVPNDNSServers() where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
-                if !servers.contains(ip) { servers.append(ip) }
-            }
-        } else {
+        let vpnInterfaceActive = hasActiveVPNIPv4Interface()
+        if !vpnInterfaceActive {
             clearPreservedVPNDNSServers()
         }
 
         guard let store = SCDynamicStoreCreate(nil, "DNSSwitcher" as CFString, nil, nil) else {
+            if vpnInterfaceActive {
+                for ip in loadPreservedVPNDNSServers() where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                    if !servers.contains(ip) { servers.append(ip) }
+                }
+            }
             return servers
         }
 
@@ -185,6 +183,13 @@ public enum SystemDNSManager {
             }
         }
 
+        // 3. Fallback to preserved VPN DNS if live sources were overwritten
+        if vpnInterfaceActive {
+            for ip in loadPreservedVPNDNSServers() where isValidNonLoopbackIPv4(ip) && !ignoringBootstrapIPs.contains(ip) {
+                if !servers.contains(ip) { servers.append(ip) }
+            }
+        }
+
         return servers
     }
 
@@ -195,6 +200,15 @@ public enum SystemDNSManager {
               let scriptLogPath = openVPNState["ScriptLogFile"] as? String else {
             return []
         }
+
+        cacheLock.lock()
+        if let cached = cachedTunnelblickDNS,
+           cached.scriptLogPath == scriptLogPath,
+           cached.expiresAt > Date() {
+            cacheLock.unlock()
+            return cached.servers
+        }
+        cacheLock.unlock()
 
         let logURL = URL(fileURLWithPath: scriptLogPath)
         let logsDir = logURL.deletingLastPathComponent()
@@ -227,14 +241,24 @@ public enum SystemDNSManager {
         guard let handle = try? FileHandle(forReadingFrom: latestLog) else { return [] }
         defer { try? handle.close() }
         let fileSize = (try? handle.seekToEnd()) ?? 0
-        let tailOffset = fileSize > 65536 ? fileSize - 65536 : 0
+        let chunkLimit: UInt64 = 65536
+        let tailOffset = fileSize > chunkLimit ? fileSize - chunkLimit : 0
         try? handle.seek(toOffset: tailOffset)
         let tailData = handle.readDataToEndOfFile()
-        guard let tailText = String(data: tailData, encoding: .utf8) ?? String(data: tailData, encoding: .isoLatin1) else {
-            return []
+        let tailText = String(data: tailData, encoding: .utf8) ?? String(data: tailData, encoding: .isoLatin1) ?? ""
+
+        var parsed = parseOpenVPNPushedDNS(from: tailText)
+        if parsed.isEmpty && fileSize > chunkLimit {
+            try? handle.seek(toOffset: 0)
+            let headData = handle.readData(ofLength: Int(chunkLimit))
+            let headText = String(data: headData, encoding: .utf8) ?? String(data: headData, encoding: .isoLatin1) ?? ""
+            parsed = parseOpenVPNPushedDNS(from: headText)
         }
 
-        return parseOpenVPNPushedDNS(from: tailText)
+        cacheLock.lock()
+        cachedTunnelblickDNS = (scriptLogPath, parsed, Date().addingTimeInterval(30.0))
+        cacheLock.unlock()
+        return parsed
     }
 
     /// Parses `dhcp-option DNS <ip>` entries from the latest `PUSH_REPLY` line in an OpenVPN log.
@@ -245,7 +269,9 @@ public enum SystemDNSManager {
         }
 
         var ips: [String] = []
-        let tokens = pushLine.components(separatedBy: CharacterSet(charactersIn: ",' "))
+        let tokens = pushLine
+            .components(separatedBy: CharacterSet(charactersIn: ",' "))
+            .filter { !$0.isEmpty }
         var idx = 0
         while idx + 2 < tokens.count {
             if tokens[idx] == "dhcp-option" && tokens[idx + 1] == "DNS" {

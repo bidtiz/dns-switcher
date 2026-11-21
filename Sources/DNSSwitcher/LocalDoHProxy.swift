@@ -291,7 +291,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
 
         // 3. Query active DoH provider via RFC 8484 GET (?dns=...) with singleflight coalescing
         let start = DispatchTime.now()
-        if let (dohReply, ips) = await performCoalescedDoHRequest(key: cacheKey, query: query, dohURL: provider.dohURL) {
+        if let (dohReply, ips) = await performCoalescedDoHRequest(key: cacheKey, query: query, qtype: question.qtype, dohURL: provider.dohURL) {
             let rcode = (dohReply.count >= 4) ? (dohReply[3] & 0x0F) : 0
 
             // Auto-fallback to active VPN DNS if DoH returned NXDOMAIN (rcode 3) or an empty A answer.
@@ -614,12 +614,12 @@ public final class LocalDoHProxy: @unchecked Sendable {
         return nil
     }
 
-    private func performCoalescedDoHRequest(key: String, query: Data, dohURL: String) async -> (Data, [String])? {
-        let task = getOrCreateInFlightTask(key: key, query: query, dohURL: dohURL)
+    private func performCoalescedDoHRequest(key: String, query: Data, qtype: UInt16, dohURL: String) async -> (Data, [String])? {
+        let task = getOrCreateInFlightTask(key: key, query: query, qtype: qtype, dohURL: dohURL)
         return await task.value
     }
 
-    private func getOrCreateInFlightTask(key: String, query: Data, dohURL: String) -> Task<(Data, [String])?, Never> {
+    private func getOrCreateInFlightTask(key: String, query: Data, qtype: UInt16, dohURL: String) -> Task<(Data, [String])?, Never> {
         lock.lock()
         defer { lock.unlock() }
         if let existingTask = inFlightRequests[key] {
@@ -634,7 +634,7 @@ public final class LocalDoHProxy: @unchecked Sendable {
             }
             let rcode = (dohReply.count >= 4) ? (dohReply[3] & 0x0F) : 0
             let ips = DNSPacket.extractARecords(from: dohReply)
-            let shouldDeferCacheForVPN = (rcode == 3 || (rcode == 0 && ips.isEmpty)) && SystemDNSManager.hasActiveVPNIPv4Interface()
+            let shouldDeferCacheForVPN = (rcode == 3 || (rcode == 0 && ips.isEmpty && qtype == 1)) && SystemDNSManager.hasActiveVPNIPv4Interface()
             if !shouldDeferCacheForVPN {
                 let ttl = DNSPacket.extractMinTTL(from: dohReply, defaultTTL: 60)
                 self.setCached(key: key, data: dohReply, freshTTL: ttl, ips: ips)
